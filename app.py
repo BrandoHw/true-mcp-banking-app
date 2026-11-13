@@ -1,29 +1,28 @@
 
-import json
+import asyncio
 import os
 import re
 import sqlite3
-import sqlparse
+import subprocess
+import sys
 import streamlit as st
 from google.genai import types
 from google.adk.agents import Agent
 from google.adk.models import LlmResponse
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StdioServerParameters
 
 # ==============================================================================
-# 1. Page Configuration
+# 1. Page Configuration & Safe Secrets Resolution
 # ==============================================================================
 st.set_page_config(
-    page_title="MCP Banking Virtual Analyst",
-    page_icon="🏦",
+    page_title="True MCP Banking Virtual Analyst",
+    page_icon="🔌",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# ==============================================================================
-# 2. Safe Secret Resolution (Streamlit Cloud Friendly)
-# ==============================================================================
 api_key = ""
 try:
     if "GOOGLE_API_KEY" in st.secrets:
@@ -33,91 +32,25 @@ except Exception:
 
 if api_key:
     os.environ["GOOGLE_API_KEY"] = api_key
-
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "FALSE")
-
-DB_FILE = "bank11.sqlite"
-SCHEMA_FILE = "bank_schema.txt"
 
 if not os.environ.get("GOOGLE_API_KEY"):
     st.error(
-        "⚠️ **GOOGLE_API_KEY is not configured!**\n\n"
-        "Please go to your Streamlit Cloud Dashboard: **App Settings** -> **Secrets**, "
-        "and add:\n```toml\nGOOGLE_API_KEY = \"your_gemini_api_key_here\"\n```"
+        "⚠️ **GOOGLE_API_KEY is missing!**\n\n"
+        "Go to Streamlit Cloud Dashboard: **App Settings** -> **Secrets** and add:\n"
+        "```toml\nGOOGLE_API_KEY = \"your_gemini_api_key_here\"\n```"
     )
     st.stop()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MCP_SERVER_SCRIPT = os.path.join(BASE_DIR, "mcp_db_server.py")
+DB_FILE = os.path.join(BASE_DIR, "bank11.sqlite")
+
 # ==============================================================================
-# 3. Database Bootstrap & Migration Functions
+# 2. Live Schema Evolution Demo Helpers (Admin Controls)
 # ==============================================================================
-def ensure_database():
-    """Initializes standard baseline database if bank11.sqlite does not exist."""
-    if not os.path.exists(DB_FILE):
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.executescript("""
-        CREATE TABLE IF NOT EXISTS branches (
-            branch_id TEXT PRIMARY KEY,
-            branch_name TEXT NOT NULL,
-            city TEXT NOT NULL,
-            state TEXT NOT NULL,
-            region TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS customers (
-            customer_id TEXT PRIMARY KEY,
-            branch_id TEXT NOT NULL,
-            full_name TEXT NOT NULL,
-            customer_segment TEXT NOT NULL,
-            join_date TEXT NOT NULL,
-            FOREIGN KEY (branch_id) REFERENCES branches(branch_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS accounts (
-            account_id TEXT PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            account_type TEXT NOT NULL,
-            balance REAL NOT NULL,
-            currency TEXT DEFAULT 'MYR',
-            FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
-        );
-
-        INSERT OR IGNORE INTO branches VALUES
-            ('BR_001', 'Petaling Jaya Main', 'Petaling Jaya', 'Selangor', 'Central'),
-            ('BR_002', 'Kepong Metro Prima', 'Kuala Lumpur', 'W.P. Kuala Lumpur', 'Central'),
-            ('BR_003', 'KLCC Corporate Banking', 'Kuala Lumpur', 'W.P. Kuala Lumpur', 'Central'),
-            ('BR_004', 'Georgetown Heritage', 'George Town', 'Penang', 'Northern'),
-            ('BR_005', 'Johor Bahru City Square', 'Johor Bahru', 'Johor', 'Southern');
-
-        INSERT OR IGNORE INTO customers VALUES
-            ('CUST_901', 'BR_001', 'Tan Wei Ming', 'Premier Banking', '2023-01-15'),
-            ('CUST_902', 'BR_001', 'Ahmad Farhan', 'Mass Affluent', '2023-03-22'),
-            ('CUST_903', 'BR_001', 'Siti Nurhaliza', 'Mass Retail', '2024-06-10'),
-            ('CUST_904', 'BR_001', 'Kavitha Pillai', 'Premier Banking', '2024-08-01'),
-            ('CUST_905', 'BR_002', 'Chong Chee Keong', 'Mass Retail', '2022-11-05'),
-            ('CUST_906', 'BR_002', 'Faridah binti Osman', 'Mass Affluent', '2023-09-19'),
-            ('CUST_907', 'BR_002', 'Lee Kuan Yew', 'Premier Banking', '2024-02-14'),
-            ('CUST_908', 'BR_003', 'Goh Chok Tong', 'Private Wealth', '2021-05-18'),
-            ('CUST_909', 'BR_003', 'Zainal Abidin', 'Corporate Banking', '2022-04-30'),
-            ('CUST_910', 'BR_004', 'Lim Guan Eng', 'Mass Affluent', '2023-07-09');
-
-        INSERT OR IGNORE INTO accounts VALUES
-            ('ACC_1001', 'CUST_901', 'Savings', 45200.50, 'MYR'),
-            ('ACC_1002', 'CUST_902', 'Current', 12340.00, 'MYR'),
-            ('ACC_1003', 'CUST_903', 'Savings', 6800.75, 'MYR'),
-            ('ACC_1004', 'CUST_904', 'Fixed Deposit', 150000.00, 'MYR'),
-            ('ACC_1005', 'CUST_905', 'Savings', 3200.00, 'MYR'),
-            ('ACC_1006', 'CUST_906', 'Current', 28900.20, 'MYR'),
-            ('ACC_1007', 'CUST_907', 'Fixed Deposit', 300000.00, 'MYR'),
-            ('ACC_1008', 'CUST_908', 'Investment', 1250000.00, 'MYR'),
-            ('ACC_1009', 'CUST_909', 'Corporate Current', 489000.00, 'MYR'),
-            ('ACC_1010', 'CUST_910', 'Savings', 9800.00, 'MYR');
-        """)
-        conn.commit()
-        conn.close()
-
 def execute_demo_migration():
-    """Simulates a live database schema evolution: adds a new table and extra records."""
+    """Simulates a DBA migrating new tables into bank11.sqlite while app.py is running."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.executescript("""
@@ -127,129 +60,39 @@ def execute_demo_migration():
         card_type TEXT NOT NULL,
         credit_limit REAL NOT NULL,
         outstanding_balance REAL NOT NULL,
-        status TEXT NOT NULL,
-        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+        status TEXT NOT NULL
     );
-
     INSERT OR IGNORE INTO credit_cards VALUES
         ('CC_501', 'CUST_901', 'Visa Infinite', 50000.00, 12450.00, 'ACTIVE'),
         ('CC_502', 'CUST_902', 'Mastercard Platinum', 25000.00, 3120.50, 'ACTIVE'),
         ('CC_503', 'CUST_904', 'Visa Signature', 35000.00, 8900.00, 'ACTIVE'),
         ('CC_504', 'CUST_907', 'Visa Infinite', 100000.00, 45000.00, 'ACTIVE'),
         ('CC_505', 'CUST_908', 'World Elite Mastercard', 200000.00, 0.00, 'ACTIVE');
-
-    CREATE TABLE IF NOT EXISTS loan_applications (
-        application_id TEXT PRIMARY KEY,
-        customer_id TEXT NOT NULL,
-        loan_type TEXT NOT NULL,
-        applied_amount REAL NOT NULL,
-        status TEXT NOT NULL,
-        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
-    );
-
-    INSERT OR IGNORE INTO loan_applications VALUES
-        ('LOAN_801', 'CUST_901', 'Car Loan', 85000.00, 'APPROVED'),
-        ('LOAN_802', 'CUST_902', 'Mortgage', 520000.00, 'UNDER_REVIEW'),
-        ('LOAN_803', 'CUST_903', 'Personal Loan', 15000.00, 'APPROVED'),
-        ('LOAN_804', 'CUST_905', 'Car Loan', 65000.00, 'APPROVED'),
-        ('LOAN_805', 'CUST_906', 'SME Business Loan', 250000.00, 'REJECTED');
     """)
     conn.commit()
     conn.close()
 
 def get_live_ddl() -> str:
-    """Extracts live DDL statements directly from the active database."""
+    if not os.path.exists(DB_FILE):
+        return "Database will be initialized on first MCP server connection."
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-    statements = [row[0] for row in cur.fetchall() if row[0]]
+    ddl = "\n\n".join([r[0] for r in cur.fetchall() if r[0]])
     conn.close()
-    return "\n\n".join(statements)
-
-ensure_database()
+    return ddl
 
 # ==============================================================================
-# 4. MCP Protocol Primitives & Security Guardrails
+# 3. Guardrails & PDPA Anonymizer
 # ==============================================================================
-def is_sql_mutation(sql_query: str) -> bool:
-    """AST parser rejecting any DDL/DML mutation attempt."""
-    cleaned = sql_query.strip().strip(";")
-    parsed = sqlparse.parse(cleaned)
-    if not parsed:
-        return False
-    forbidden = {
-        'DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'TRUNCATE',
-        'PRAGMA', 'REPLACE', 'CREATE', 'RENAME', 'ATTACH', 'DETACH'
-    }
-    for stmt in parsed:
-        if stmt.get_type() != 'SELECT':
-            return True
-        for token in stmt.flatten():
-            if token.value.upper() in forbidden:
-                return True
-    return False
-
 def anonymize_text(text: str) -> str:
-    """Masks banking primary/foreign keys to comply with PDPA."""
     text = re.sub(r'\b(CUST_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
     text = re.sub(r'\b(BR_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
     text = re.sub(r'\b(ACC_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(LOAN_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
     text = re.sub(r'\b(CC_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
     return text
 
-def mcp_list_tables() -> str:
-    """MCP Tool: Discovers all currently available tables in the database."""
-    try:
-        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-        tables = [row[0] for row in cur.fetchall()]
-        conn.close()
-        return json.dumps({"status": "success", "tables": tables})
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-def mcp_describe_table(table_name: str) -> str:
-    """MCP Tool: Dynamically inspects column definitions and keys of any table."""
-    cleaned = table_name.strip().strip("'").strip('"')
-    try:
-        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({cleaned});")
-        cols = [{"cid": r[0], "name": r[1], "type": r[2], "notnull": r[3], "pk": r[5]} for r in cur.fetchall()]
-        conn.close()
-        if not cols:
-            return json.dumps({"status": "error", "message": f"Table '{cleaned}' not found."})
-        return json.dumps({"status": "success", "table": cleaned, "columns": cols})
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-def mcp_read_query(sql_query: str) -> str:
-    """MCP Tool: Executes a read-only SELECT query against the live database."""
-    if is_sql_mutation(sql_query):
-        return json.dumps({
-            "status": "blocked",
-            "error": "🛡️ [MCP PROTOCOL ENFORCEMENT]: Mutation operations (DROP, DELETE, UPDATE) are strictly forbidden."
-        })
-    try:
-        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
-        cur = conn.cursor()
-        cur.execute(sql_query.strip())
-        columns = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchall()
-        conn.close()
-        return json.dumps({
-            "status": "success",
-            "columns": columns,
-            "rows": [list(r) for r in rows[:50]],
-            "count": len(rows)
-        })
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
 def before_model_guardrail(callback_context, llm_request):
-    """Short-circuits destructive or prompt-injection attempts before calling the LLM."""
     last_text = ""
     if llm_request.contents and llm_request.contents[-1].parts:
         last_text = (llm_request.contents[-1].parts[0].text or "").lower()
@@ -259,159 +102,159 @@ def before_model_guardrail(callback_context, llm_request):
             role="model",
             parts=[types.Part(
                 text="🛡️ **[GUARDRAIL INTERVENTION]**: Request blocked by Banking Safety Policy. "
-                     "Operations are strictly read-only. Data modifications are not permitted."
+                     "Operations are strictly read-only."
             )]
         ))
     return None
 
 # ==============================================================================
-# 5. Agent Initialization
+# 4. Async True-MCP Turn Executor (Spawns MCPServer Subprocess per Turn)
 # ==============================================================================
-@st.cache_resource
-def get_mcp_agent():
-    return Agent(
-        name="bank_mcp_analyst",
-        model="gemini-2.5-flash",
-        description="Virtual Banking Analyst utilizing Model Context Protocol.",
-        instruction=(
-            "You are an enterprise Virtual Banking Data Analyst operating through the Model Context Protocol (MCP).\n"
-            "You do NOT have a static hardcoded database schema.\n"
-            "Instead, you must dynamically interact with the database using your MCP tools:\n"
-            "1. Call 'mcp_list_tables' to see what tables currently exist in the database.\n"
-            "2. Call 'mcp_describe_table' to inspect the columns of any table you need to query.\n"
-            "3. Call 'mcp_read_query' to execute read-only SELECT statements to answer the user's question.\n\n"
-            "RULES:\n"
-            "- Always verify table names and columns dynamically using the MCP tools rather than assuming.\n"
-            "- If asked general questions (e.g. 'Who are you?'), introduce yourself clearly.\n"
-            "- Summarize findings into concise business insights.\n"
-            "- Mutation operations (DROP, DELETE, UPDATE, INSERT) are strictly prohibited.\n"
+async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str]]:
+    """Connects to mcp_db_server.py over STDIO JSON-RPC, runs the ADK agent, and closes cleanly."""
+    mcp_toolset = McpToolset(
+        connection_params=StdioServerParameters(
+            command=sys.executable,
+            args=[MCP_SERVER_SCRIPT, DB_FILE]
         ),
-        tools=[mcp_list_tables, mcp_describe_table, mcp_read_query],
-        before_model_callback=before_model_guardrail
+        tool_filter=["list_tables", "describe_table", "read_query"],
+        errlog=subprocess.DEVNULL
     )
 
+    try:
+        agent = Agent(
+            name="true_mcp_bank_analyst",
+            model="gemini-2.5-flash",
+            description="Virtual Banking Analyst connected via real MCP JSON-RPC protocol.",
+            instruction=(
+                "You are an enterprise Virtual Banking Data Analyst connected to an external MCP database server.\n"
+                "Always discover available tables via 'list_tables', inspect columns via 'describe_table', "
+                "and query data via 'read_query'. Provide concise, executive-ready insights."
+            ),
+            tools=[mcp_toolset],
+            before_model_callback=before_model_guardrail
+        )
+
+        session_service = InMemorySessionService()
+        session_id = "mcp_turn_session"
+        session = await session_service.create_session(
+            app_name="true_mcp_cloud", user_id="officer", session_id=session_id
+        )
+
+        for m in history[-6:]:
+            role = "user" if m["role"] == "user" else "model"
+            session.events.append(
+                types.Content(role=role, parts=[types.Part.from_text(text=m["content"])])
+            )
+
+        runner = Runner(
+            agent=agent,
+            app_name="true_mcp_cloud",
+            session_service=session_service,
+            auto_create_session=True
+        )
+
+        msg = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        reply_parts = []
+        tools_called = []
+
+        async for event in runner.run_async(user_id="officer", session_id=session_id, new_message=msg):
+            if hasattr(event, "content") and event.content and event.content.parts:
+                for part in event.content.parts:
+                    if getattr(part, "function_call", None):
+                        tools_called.append(part.function_call.name)
+                    elif getattr(part, "text", None):
+                        reply_parts.append(part.text)
+
+        final_text = "".join(reply_parts) if reply_parts else "No response generated."
+        return anonymize_text(final_text), tools_called
+    finally:
+        await mcp_toolset.close()
+
 # ==============================================================================
-# 6. Streamlit Session State & Runner Setup
+# 5. Sidebar Controls & Live Schema Viewer
 # ==============================================================================
-if "session_service" not in st.session_state:
-    st.session_state.session_service = InMemorySessionService()
-    st.session_state.session_id = "cloud_mcp_session_001"
-    st.session_state.session_service.create_session(
-        app_name="mcp_bank_cloud_app",
-        user_id="st_cloud_officer",
-        session_id=st.session_state.session_id
-    )
-    st.session_state.runner = Runner(
-        agent=get_mcp_agent(),
-        app_name="mcp_bank_cloud_app",
-        session_service=st.session_state.session_service,
-        auto_create_session=True
-    )
+if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# ==============================================================================
-# 7. Sidebar: Guidance, Live Migration Demo & Schema Viewer
-# ==============================================================================
 with st.sidebar:
-    st.title("🏦 Bank Analyst Portal")
-    st.markdown("**AI-Powered Banking Analytics (MCP Architecture)**")
+    st.title("🔌 True MCP Portal")
+    st.caption("ADK `McpToolset` ↔ `MCPServer` STDIO")
     st.markdown("---")
 
-    # --------------------------------------------------------------------------
-    # LIVE DATABASE EVOLUTION SIMULATOR (MCP DEMO)
-    # --------------------------------------------------------------------------
-    st.subheader("⚡ Live Database Evolution (MCP Demo)")
-    st.caption("Simulate a database change mid-session to verify that the MCP agent adapts with zero code changes:")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🚀 Add Tables", use_container_width=True, help="Migrates credit_cards & loan_applications tables into SQLite"):
+    st.subheader("⚡ Live Database Evolution")
+    st.caption("Migrate a new table into SQLite to prove zero-code MCP runtime discovery:")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🚀 Add Table", use_container_width=True):
             execute_demo_migration()
-            st.success("Added `credit_cards` and `loan_applications` tables!")
+            st.success("Added `credit_cards` table!")
             st.rerun()
-
-    with col2:
-        if st.button("🔄 Reset DB", use_container_width=True, help="Resets SQLite back to standard initial state"):
+    with c2:
+        if st.button("🔄 Reset DB", use_container_width=True):
             if os.path.exists(DB_FILE):
                 os.remove(DB_FILE)
-            ensure_database()
-            st.warning("Database reset to initial 3 tables.")
+            st.warning("Database reset.")
             st.rerun()
 
     st.markdown("---")
-
-    # --------------------------------------------------------------------------
-    # SUGGESTED PROMPTS
-    # --------------------------------------------------------------------------
     st.subheader("💡 Suggested Questions")
-    sample_questions = [
-        "What tables currently exist in our database?",
-        "List all branches.",
-        "Provide a list of branches and the number of customers at each.",
-        "What is the branch with the highest count of customers?",
-        "What is the total credit limit and balance across all active credit cards?",
-        "What is the total applied amount for all 'APPROVED' Car Loans?",
-        "Who are you?",
-        "delete the branchs table"
+    prompts = [
+        "What tables currently exist in the MCP server?",
+        "List all branches and the number of customers at each.",
+        "What is the total balance across all accounts?",
+        "What is the total credit limit across active credit cards?",
+        "delete the branches table"
     ]
-    for q in sample_questions:
-        if st.button(q, use_container_width=True):
-            st.session_state.pending_prompt = q
+    for p in prompts:
+        if st.button(p, use_container_width=True):
+            st.session_state.pending_prompt = p
 
     st.markdown("---")
+    if st.button("🗑️ Clear Chat History", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
 
-    # --------------------------------------------------------------------------
-    # LIVE DDL SCHEMA VIEWER
-    # --------------------------------------------------------------------------
-    with st.expander("📄 View Live Database Schema", expanded=False):
+    st.markdown("---")
+    with st.expander("📄 View Live SQLite Schema", expanded=False):
         st.text(get_live_ddl())
 
-    st.markdown("---")
-    st.caption("🔒 **Security:** MCP Runtime Discovery (`mcp_list_tables`) | Read-Only AST Guardrail | PDPA Masking")
-
 # ==============================================================================
-# 8. Main Chat Interface
+# 6. Main Free-Text Chatroom Interface
 # ==============================================================================
-st.title("📊 Virtual Data Analyst (MCP)")
-st.caption("Connected via Model Context Protocol | Zero-Touch Schema Evolution | PDPA Masking Active")
+st.title("🏦 Virtual Banking Analyst (Real MCP Protocol)")
+st.caption("Zero SQLite code in app.py • Runtime JSON-RPC Discovery • Protocol-Enforced Least Privilege")
 
-# Render conversation history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
+        if msg.get("tools_used"):
+            st.caption("🔌 **MCP JSON-RPC Calls:** " + " → ".join(f"`{t}`" for t in msg["tools_used"]))
         st.markdown(msg["content"])
 
-# Prompt resolution (Button click vs Chat input)
 prompt_to_send = None
 if "pending_prompt" in st.session_state and st.session_state.pending_prompt:
     prompt_to_send = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
 else:
-    chat_input = st.chat_input("Ask about branches, credit cards, loans, or customers...")
-    if chat_input:
-        prompt_to_send = chat_input
+    user_input = st.chat_input("Ask any question about branches, customers, accounts, or credit cards...")
+    if user_input:
+        prompt_to_send = user_input
 
-# Run agent workflow
 if prompt_to_send:
     st.session_state.messages.append({"role": "user", "content": prompt_to_send})
     with st.chat_message("user"):
         st.markdown(prompt_to_send)
 
     with st.chat_message("assistant"):
-        with st.spinner("Executing MCP data tools and verifying guardrails..."):
-            user_msg = types.Content(role="user", parts=[types.Part.from_text(text=prompt_to_send)])
-            events = st.session_state.runner.run(
-                user_id="st_cloud_officer",
-                session_id=st.session_state.session_id,
-                new_message=user_msg
+        with st.spinner("Connecting to MCPServer over STDIO JSON-RPC..."):
+            reply_text, tools_used = asyncio.run(
+                run_true_mcp_turn(prompt_to_send, st.session_state.messages[:-1])
             )
-            response_parts = []
-            for e in events:
-                if hasattr(e, "content") and e.content:
-                    for p in e.content.parts:
-                        if hasattr(p, "text") and p.text:
-                            response_parts.append(p.text)
-
-            raw_reply = "".join(response_parts) if response_parts else "No response generated."
-            final_reply = anonymize_text(raw_reply)
-            st.markdown(final_reply)
-            st.session_state.messages.append({"role": "assistant", "content": final_reply})
+            if tools_used:
+                st.caption("🔌 **MCP JSON-RPC Calls:** " + " → ".join(f"`{t}`" for t in tools_used))
+            st.markdown(reply_text)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": reply_text,
+                "tools_used": tools_used
+            })
